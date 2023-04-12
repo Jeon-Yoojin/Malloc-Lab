@@ -20,6 +20,7 @@
 
 #define PRVP(bp)    (*(void **)(bp))
 #define NEXP(bp)    (*(void **)((char *)bp + WSIZE))
+#define SEGLIST_INDEX 32
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +58,7 @@ team_t team = {
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 static void *heap_listp;
-static void *linked_list_top;
+const char* seg_list[SEGLIST_INDEX];
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 static void append_linked_list(void *bp);
@@ -76,14 +77,24 @@ int mm_init(void)
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));
     PUT(heap_listp + (3*WSIZE), PACK(0, 1));
 
-    heap_listp += (2*WSIZE);
-
-    linked_list_top = NULL;
+    /* 각각의 루트 초기화 */
+    for(int i = 0; i < SEGLIST_INDEX ; i++) {
+        seg_list[i] = NULL;
+    }
 
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
         return -1;
     return 0;
+}
+
+/* 해당 size의 index를 찾아 주는 함수 */
+static void *find_index(size_t size) {
+    int index = 0;
+    
+    /* 2 ** index보다 size가 크고 index가 32(seglist 크기)를 넘지 않으면 index 1 증가 */
+    for(index = 0; (1 << index) < size && index < SEGLIST_INDEX; index++);
+    return index;
 }
 
 static void *extend_heap(size_t words)
@@ -98,11 +109,6 @@ static void *extend_heap(size_t words)
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
-    
-    // // 새로 만들어진 블록을 root가 가리키도록
-    // linked_list_top = bp;
-    // PUT(PRVP(bp), NULL);
-    // PUT(NEXP(bp), NULL);
 
     return coalesce(bp);
 }
@@ -110,10 +116,15 @@ static void *extend_heap(size_t words)
 static void *find_fit(size_t asize)
 {
     void *ptr = NULL;
-    // for(ptr = linked_list_top; NEXP(ptr) != NULL; ptr = (NEXP(ptr))) {
-    for(ptr = linked_list_top; ptr != NULL; ptr = (NEXP(ptr))) {
-        if (!GET_ALLOC(HDRP(ptr)) && (asize <= GET_SIZE(HDRP(ptr)))) {
-            return ptr;
+    int index = find_index(asize);
+    
+    /* 현재 들어갈 수 있는 index는 find_index를 통해 찾은 index보다 크거나 같은 인덱스이다. */
+    /* 만약 해당 index에 가용 블록이 없는 상황이라면 더 큰 size의 index에 할당해야 한다. */
+    for(int i = index; i < SEGLIST_INDEX; i++){
+        for(ptr = seg_list[i]; ptr != NULL; ptr = (NEXP(ptr))) {
+            if (!GET_ALLOC(HDRP(ptr)) && (asize <= GET_SIZE(HDRP(ptr)))) {
+                return ptr;
+            }
         }
     }
     return NULL;
@@ -173,16 +184,21 @@ void *mm_malloc(size_t size)
 
 static void append_linked_list(void *bp) {
     // 현재 블록의 next를 가장 상위 블록의 prev를 가리키도록
-    NEXP(bp) = linked_list_top;
-    // 상위 블록의 prev를 현재 블록의 prev를 가리키도록
-    if (linked_list_top != NULL){
-        PRVP(linked_list_top) = bp;
+    int index = find_index(GET_SIZE(HDRP(bp)));
+    NEXP(bp) = seg_list[index];
+    // 현재 블록의 root가 있는 경우
+    if (seg_list[index] != NULL){
+        // 연결 리스트의 가장 상위에 있던 원소의 prev 노드에 bp 연결
+        PRVP(seg_list[index]) = bp;
     }
-    linked_list_top = bp;
+    // 현재 블록의 root가 없는 경우, 루트가 bp를 가리키도록
+    seg_list[index] = bp;
 }
 
 static void remove_linked_list(char *bp) {
-    if (bp != linked_list_top) {
+    int index = find_index(GET_SIZE(HDRP(bp)));
+    // bp가 루트가 아닌 경우
+    if (bp != seg_list[index]) {
         // 삭제할 이전 블록의 next를 다음 블록의 prev를 가리키도록
             NEXP(PRVP(bp)) = NEXP(bp);
         // 삭제할 다음 블록의 prev를 이전 블록의 prev를 가리키도록
@@ -191,27 +207,29 @@ static void remove_linked_list(char *bp) {
             PRVP(NEXP(bp)) = PRVP(bp);
         }
     }
+    // bp가 루트인 경우
     else {
-        linked_list_top = NEXP(bp);
+        // 루트에 새로운 top이 될 블록을 연결
+        seg_list[index] = NEXP(bp);
+        //PRVP(bp) = NULL;
     }
 }
 
+/* coalesce 함수는 explicit 방식과 차이가 없다. */
 static void *coalesce(void *bp)
 {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
+    /* CASE 1 */
     if (prev_alloc && next_alloc) {
-        // 연결리스트의 가장 상위의 블록을 찾기
         append_linked_list(bp);
         return bp;
     }
     /* CASE 2 */
     else if (prev_alloc && !next_alloc) {
-        // prev block, next block size를 더하기
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        // [뒤 블록을 연결리스트에서 제거]
         remove_linked_list(NEXT_BLKP(bp));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
