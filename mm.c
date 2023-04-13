@@ -134,20 +134,16 @@ static void place(void *bp, size_t asize)
 {
     // 나머지 부분의 크기가 최소 블록 크기와 같거나 큰지 확인
     size_t csize = GET_SIZE(HDRP(bp));
-    if ((csize - asize) >= (2 * DSIZE)) {
-        remove_linked_list(bp);
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize - asize, 0));
-        PUT(FTRP(bp), PACK(csize - asize, 0));
-        append_linked_list(bp);
+    remove_linked_list(bp);
+    // asize가 내가 할당받은 블록보다 크면 나눠주기
+    while (csize != asize) {
+        csize /= 2;
+        PUT(HDRP(bp + csize), PACK(csize, 0));
+        PUT(FTRP(bp + csize), PACK(csize, 0));
+        append_linked_list(bp + csize);
     }
-    else {
-        remove_linked_list(bp);
-        PUT(HDRP(bp), PACK(csize, 1));
-        PUT(FTRP(bp), PACK(csize, 1));
-    }
+    PUT(HDRP(bp), PACK(csize, 1));
+    PUT(FTRP(bp), PACK(csize, 1));
 }
 
 /* 
@@ -166,8 +162,17 @@ void *mm_malloc(size_t size)
 
     if (size <= DSIZE)
         asize = 2 * DSIZE;
-    else
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    else{
+        //asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+        // 최소 블록 크기가 Padding(unsigned), H(Header), F(Footer), Epilog 4개의 워드 크기
+        asize = 2 * DSIZE;
+        while(asize < size + DSIZE) {
+            // i를 1씩 증가시키면서 2^i제곱과 asize를 비교하고, asize가 작아지는 경우 while문을 빠져나온다.
+            //if ((1 << i) > size + (DSIZE)) {
+            asize = asize << 1;
+        }
+    }
+        
     
     if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
@@ -220,40 +225,36 @@ static void *coalesce(void *bp)
 {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-    size_t size = GET_SIZE(HDRP(bp));
+    int base = 3 * WSIZE + mem_heap_lo();
 
-    /* CASE 1 */
-    if (prev_alloc && next_alloc) {
-        append_linked_list(bp);
-        return bp;
-    }
-    /* CASE 2 */
-    else if (prev_alloc && !next_alloc) {
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        remove_linked_list(NEXT_BLKP(bp));
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
-        append_linked_list(bp);
-    }
-    /* CASE 3 */
-    else if (!prev_alloc && next_alloc) {
-        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        remove_linked_list(PREV_BLKP(bp));
-        PUT(FTRP(bp), PACK(size, 0));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        bp = PREV_BLKP(bp);
-        append_linked_list(bp);
+    // size가 같고 인접한 블록인 경우에
+    while (1) {
+        size_t size = GET_SIZE(HDRP(bp));
+        unsigned int buddy = size & ((unsigned int)bp - base);
 
-    }
-    /* CASE 4 */
-    else {
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-        remove_linked_list(PREV_BLKP(bp));
-        remove_linked_list(NEXT_BLKP(bp));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-        bp = PREV_BLKP(bp);
-        append_linked_list(bp);
+        if (buddy == 0) {
+            if (GET_ALLOC(HDRP(bp + size)) == 0 && GET_SIZE(HDRP(bp + size)) == size) {
+                remove_linked_list(bp + size);
+                PUT(HDRP(bp), PACK(2 * size, 0));
+                PUT(FTRP(bp), PACK(2 * size, 0));
+            }
+            else {
+                append_linked_list(bp);
+                break;
+            }
+        }
+        else {
+            if (GET_ALLOC(HDRP(bp - size)) == 0 && GET_SIZE(HDRP(bp - size)) == size) {
+                bp = bp - size;
+                remove_linked_list(bp);
+                PUT(HDRP(bp), PACK(2 * size, 0));
+                PUT(FTRP(bp), PACK(2 * size, 0));
+            }
+            else {
+                append_linked_list(bp);
+                break;
+            }
+        }
     }
     return bp;
 }
